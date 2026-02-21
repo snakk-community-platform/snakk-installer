@@ -9,7 +9,7 @@
 # Supported distros: Ubuntu, Debian, Rocky Linux, AlmaLinux, RHEL
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/snakk-community-platform/snakk/main/docker/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/snakk-community-platform/snakk-installer/main/docker/install.sh | sudo bash
 #   — or —
 #   sudo bash install.sh
 # =============================================================================
@@ -40,13 +40,20 @@ ask_yes_no() {
     local prompt="$1" default="${2:-y}"
     local yn
     if [[ "$default" == "y" ]]; then
-        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [Y/n]: ")" yn
+        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [Y/n]: ")" yn < /dev/tty
         yn="${yn:-y}"
     else
-        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [y/N]: ")" yn
+        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [y/N]: ")" yn < /dev/tty
         yn="${yn:-n}"
     fi
     [[ "${yn,,}" == "y" ]]
+}
+
+ask_input() {
+    local prompt="$1"
+    local result
+    read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt}")" result < /dev/tty
+    echo "${result}"
 }
 
 require_root() {
@@ -256,7 +263,7 @@ configure_caddy() {
     fi
 
     echo ""
-    read -rp "$(echo -e "${BLUE}[?]${NC} Enter your domain for HTTPS (e.g. forum.example.com), or press Enter to skip: ")" DOMAIN
+    DOMAIN=$(ask_input "Enter your domain for HTTPS (e.g. forum.example.com), or press Enter to skip: ")
 
     if [[ -z "${DOMAIN}" ]]; then
         info "No domain provided — skipping Caddy configuration."
