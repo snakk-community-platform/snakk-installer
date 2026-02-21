@@ -378,14 +378,6 @@ print_summary() {
         url="http://${ip}:${SNAKK_PORT}"
     fi
 
-    # Truncate password for display
-    local pw_display
-    if [[ "${#DB_PASSWORD}" -gt 8 ]]; then
-        pw_display="${DB_PASSWORD:0:4}...${DB_PASSWORD: -4}"
-    else
-        pw_display="${DB_PASSWORD}"
-    fi
-
     echo ""
     echo -e "${GREEN}"
     cat <<'BANNER'
@@ -396,7 +388,13 @@ BANNER
     echo -e "${NC}"
 
     echo "  Install directory:  ${INSTALL_DIR}"
-    echo "  Database password:  ${pw_display} (saved in docker/.env)"
+    echo ""
+    echo "  Database credentials (use these in the setup wizard):"
+    echo "    Host:      postgres"
+    echo "    Port:      5432"
+    echo "    Database:  snakk"
+    echo "    Username:  snakk"
+    echo "    Password:  ${DB_PASSWORD}"
     echo ""
     echo "  Next step:"
     echo "    Visit ${url}/setup"
