@@ -397,7 +397,7 @@ BANNER
     echo "    Password:  ${DB_PASSWORD}"
     echo ""
     echo "  Next step:"
-    echo "    Visit ${url}/setup"
+    echo "    Visit ${url}"
     echo "    Complete the setup wizard in your browser."
     echo ""
     echo "  Useful commands:"
