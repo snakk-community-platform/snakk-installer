@@ -15,6 +15,10 @@
 # =============================================================================
 set -euo pipefail
 
+# When piped via "curl ... | bash", stdin is the script itself.
+# Open /dev/tty on fd 3 so we can read user input separately.
+exec 3</dev/tty || { echo "ERROR: Cannot open /dev/tty — run this script in an interactive terminal." >&2; exit 1; }
+
 # --- Constants ---------------------------------------------------------------
 REPO_URL="https://github.com/snakk-community-platform/snakk.git"
 INSTALL_DIR="${SNAKK_INSTALL_DIR:-/opt/snakk}"
@@ -40,10 +44,10 @@ ask_yes_no() {
     local prompt="$1" default="${2:-y}"
     local yn
     if [[ "$default" == "y" ]]; then
-        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [Y/n]: ")" yn < /dev/tty
+        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [Y/n]: ")" yn <&3
         yn="${yn:-y}"
     else
-        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [y/N]: ")" yn < /dev/tty
+        read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt} [y/N]: ")" yn <&3
         yn="${yn:-n}"
     fi
     [[ "${yn,,}" == "y" ]]
@@ -52,7 +56,7 @@ ask_yes_no() {
 ask_input() {
     local prompt="$1"
     local result
-    read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt}")" result < /dev/tty
+    read -rp "$(echo -e "${BLUE}[?]${NC} ${prompt}")" result <&3
     echo "${result}"
 }
 
