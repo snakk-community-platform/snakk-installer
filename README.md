@@ -7,7 +7,7 @@ Clones the repo, installs prerequisites (Git, Docker, Caddy), tunes PostgreSQL f
 ## Quick Start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/snakk-community-platform/snakk-installer/main/docker/install.sh | sudo bash
+curl -fsSL https://get.snakk.community/install-docker.sh | sudo bash
 ```
 
 Or download and run manually:
