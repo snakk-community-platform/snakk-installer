@@ -6,7 +6,7 @@
 # containers. After this script finishes, visit the URL it prints to complete
 # setup via the browser-based wizard.
 #
-# Supported distros: Ubuntu, Debian, Rocky Linux, AlmaLinux, RHEL
+# Supported distros: Ubuntu, Debian, Linux Mint, Rocky Linux, AlmaLinux, RHEL
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/snakk-community-platform/snakk-installer/main/docker/install.sh | sudo bash
@@ -82,13 +82,14 @@ detect_distro() {
     source /etc/os-release
 
     case "${ID,,}" in
-        ubuntu)       DISTRO="ubuntu"; PKG_MGR="apt" ;;
-        debian)       DISTRO="debian"; PKG_MGR="apt" ;;
-        rocky)        DISTRO="rocky";  PKG_MGR="dnf" ;;
-        almalinux)    DISTRO="alma";   PKG_MGR="dnf" ;;
-        rhel|centos)  DISTRO="rhel";   PKG_MGR="dnf" ;;
+        ubuntu)       DISTRO="ubuntu";    PKG_MGR="apt" ;;
+        linuxmint)    DISTRO="ubuntu";    PKG_MGR="apt" ;;
+        debian)       DISTRO="debian";    PKG_MGR="apt" ;;
+        rocky)        DISTRO="rocky";     PKG_MGR="dnf" ;;
+        almalinux)    DISTRO="alma";      PKG_MGR="dnf" ;;
+        rhel|centos)  DISTRO="rhel";      PKG_MGR="dnf" ;;
         *)
-            error "Unsupported distro: ${ID}. Supported: Ubuntu, Debian, Rocky, Alma, RHEL."
+            error "Unsupported distro: ${ID}. Supported: Ubuntu, Debian, Linux Mint, Rocky, Alma, RHEL."
             exit 1
             ;;
     esac
@@ -147,7 +148,7 @@ check_and_install_docker() {
         echo \
             "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
             https://download.docker.com/linux/${DISTRO} \
-            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+            $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
             > /etc/apt/sources.list.d/docker.list
 
         apt-get update -qq
