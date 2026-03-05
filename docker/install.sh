@@ -6,7 +6,7 @@
 # containers. After this script finishes, visit the URL it prints to complete
 # setup via the browser-based wizard.
 #
-# Supported distros: Ubuntu, Debian, Linux Mint, Rocky Linux, AlmaLinux, RHEL
+# Supported distros: Ubuntu, Debian, Linux Mint, Rocky Linux, AlmaLinux, RHEL, Arch Linux
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/snakk-community-platform/snakk-installer/main/docker/install.sh | sudo bash
@@ -25,8 +25,8 @@ INSTALL_DIR="${SNAKK_INSTALL_DIR:-/opt/snakk}"
 SNAKK_PORT=17000
 
 # --- State (set during execution) -------------------------------------------
-DISTRO=""        # ubuntu | debian | rocky | alma | rhel
-PKG_MGR=""       # apt | dnf
+DISTRO=""        # ubuntu | debian | rocky | alma | rhel | arch
+PKG_MGR=""       # apt | dnf | pacman
 DOMAIN=""        # user-provided domain (empty = skip Caddy)
 DB_PASSWORD=""   # generated password
 TOTAL_RAM_MB=0   # detected total system RAM
@@ -88,8 +88,9 @@ detect_distro() {
         rocky)        DISTRO="rocky";     PKG_MGR="dnf" ;;
         almalinux)    DISTRO="alma";      PKG_MGR="dnf" ;;
         rhel|centos)  DISTRO="rhel";      PKG_MGR="dnf" ;;
+        arch)         DISTRO="arch";      PKG_MGR="pacman" ;;
         *)
-            error "Unsupported distro: ${ID}. Supported: Ubuntu, Debian, Linux Mint, Rocky, Alma, RHEL."
+            error "Unsupported distro: ${ID}. Supported: Ubuntu, Debian, Linux Mint, Rocky, Alma, RHEL, Arch."
             exit 1
             ;;
     esac
@@ -110,8 +111,10 @@ check_and_install_git() {
         info "Installing git..."
         if [[ "$PKG_MGR" == "apt" ]]; then
             apt-get update -qq && apt-get install -y -qq git
-        else
+        elif [[ "$PKG_MGR" == "dnf" ]]; then
             dnf install -y -q git
+        elif [[ "$PKG_MGR" == "pacman" ]]; then
+            pacman -S --noconfirm git
         fi
         success "Git installed."
     else
@@ -154,11 +157,13 @@ check_and_install_docker() {
         apt-get update -qq
         apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-    else
+    elif [[ "$PKG_MGR" == "dnf" ]]; then
         # RHEL-family
         dnf install -y -q dnf-plugins-core
         dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
         dnf install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    elif [[ "$PKG_MGR" == "pacman" ]]; then
+        pacman -S --noconfirm docker docker-compose
     fi
 
     systemctl enable --now docker
@@ -186,10 +191,12 @@ check_and_install_caddy() {
             > /etc/apt/sources.list.d/caddy-stable.list
         apt-get update -qq
         apt-get install -y -qq caddy
-    else
+    elif [[ "$PKG_MGR" == "dnf" ]]; then
         dnf install -y -q 'dnf-command(copr)' || true
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/setup.rpm.sh' | bash
         dnf install -y -q caddy
+    elif [[ "$PKG_MGR" == "pacman" ]]; then
+        pacman -S --noconfirm caddy
     fi
 
     success "Caddy installed."
@@ -378,8 +385,8 @@ EOF
 }
 
 configure_firewall() {
-    if [[ "$PKG_MGR" == "apt" ]]; then
-        # ufw (Ubuntu/Debian)
+    if [[ "$PKG_MGR" == "apt" ]] || [[ "$PKG_MGR" == "pacman" ]]; then
+        # ufw (Ubuntu/Debian/Arch)
         if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
             if ask_yes_no "Open ports 80 and 443 in ufw firewall?"; then
                 ufw allow 80/tcp

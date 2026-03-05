@@ -25,6 +25,7 @@ sudo bash install.sh
 - Rocky Linux (8+)
 - AlmaLinux (8+)
 - RHEL / CentOS (8+)
+- Arch Linux
 
 ## What It Does
 
