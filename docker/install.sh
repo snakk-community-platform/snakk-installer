@@ -2,9 +2,9 @@
 # =============================================================================
 # Snakk — One-Command Installer
 # =============================================================================
-# Installs prerequisites (Git, Docker, Caddy), clones the repo, and starts
-# containers. After this script finishes, visit the URL it prints to complete
-# setup via the browser-based wizard.
+# Installs prerequisites (Docker, Caddy), pulls the pre-built Docker image,
+# and starts containers. After this script finishes, visit the URL it prints
+# to complete setup via the browser-based wizard.
 #
 # Supported distros: Ubuntu, Debian, Linux Mint, Rocky Linux, AlmaLinux, RHEL, Arch Linux
 #
@@ -12,6 +12,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/snakk-community-platform/snakk-installer/main/docker/install.sh | sudo bash
 #   — or —
 #   sudo bash install.sh
+#
+# Update an existing installation:
+#   sudo bash install.sh update
 # =============================================================================
 set -euo pipefail
 
@@ -20,7 +23,8 @@ set -euo pipefail
 exec 3</dev/tty || { echo "ERROR: Cannot open /dev/tty — run this script in an interactive terminal." >&2; exit 1; }
 
 # --- Constants ---------------------------------------------------------------
-REPO_URL="https://github.com/snakk-community-platform/snakk.git"
+SNAKK_IMAGE="ghcr.io/snakk-community-platform/snakk"
+SNAKK_VERSION="${SNAKK_VERSION:-latest}"
 INSTALL_DIR="${SNAKK_INSTALL_DIR:-/opt/snakk}"
 SNAKK_PORT=17000
 
@@ -71,6 +75,36 @@ require_root() {
 }
 
 # =============================================================================
+# Update command — pull latest image and restart
+# =============================================================================
+do_update() {
+    require_root
+
+    if [[ ! -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
+        error "Snakk is not installed at ${INSTALL_DIR}. Run the installer first."
+        exit 1
+    fi
+
+    local current_version
+    current_version=$(grep "image: ${SNAKK_IMAGE}" "${INSTALL_DIR}/docker-compose.yml" | grep -oP ':\K[^ ]+$' || echo "unknown")
+    info "Current image tag: ${current_version}"
+    info "Pulling: ${SNAKK_IMAGE}:${SNAKK_VERSION}"
+
+    cd "${INSTALL_DIR}"
+    docker compose pull snakk
+    docker compose up -d snakk
+
+    success "Snakk updated to ${SNAKK_VERSION}!"
+    info "Check logs: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs -f snakk"
+    exit 0
+}
+
+# Handle "install.sh update" subcommand
+if [[ "${1:-}" == "update" ]]; then
+    do_update
+fi
+
+# =============================================================================
 # Distro detection
 # =============================================================================
 detect_distro() {
@@ -101,28 +135,6 @@ detect_distro() {
 # =============================================================================
 # Prerequisite installers
 # =============================================================================
-check_and_install_git() {
-    if command -v git &>/dev/null; then
-        success "Git is already installed ($(git --version))"
-        return
-    fi
-
-    if ask_yes_no "Git is not installed. Install it?"; then
-        info "Installing git..."
-        if [[ "$PKG_MGR" == "apt" ]]; then
-            apt-get update -qq && apt-get install -y -qq git
-        elif [[ "$PKG_MGR" == "dnf" ]]; then
-            dnf install -y -q git
-        elif [[ "$PKG_MGR" == "pacman" ]]; then
-            pacman -S --noconfirm git
-        fi
-        success "Git installed."
-    else
-        error "Git is required. Aborting."
-        exit 1
-    fi
-}
-
 check_and_install_docker() {
     if command -v docker &>/dev/null && docker compose version &>/dev/null; then
         success "Docker + Compose already installed ($(docker --version))"
@@ -205,25 +217,18 @@ check_and_install_caddy() {
 # =============================================================================
 # Snakk setup
 # =============================================================================
-clone_repo() {
-    if [[ -d "${INSTALL_DIR}/.git" ]]; then
-        info "Snakk repo already exists at ${INSTALL_DIR}. Pulling latest..."
-        git -C "${INSTALL_DIR}" pull --ff-only || warn "Could not pull — continuing with existing code."
+create_install_dir() {
+    if [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
+        info "Snakk already configured at ${INSTALL_DIR}."
         return
     fi
 
-    if [[ -d "${INSTALL_DIR}" ]] && [[ "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]]; then
-        error "${INSTALL_DIR} exists and is not empty. Remove it or set SNAKK_INSTALL_DIR to another path."
-        exit 1
-    fi
-
-    info "Cloning Snakk to ${INSTALL_DIR}..."
-    git clone "${REPO_URL}" "${INSTALL_DIR}"
-    success "Repository cloned."
+    mkdir -p "${INSTALL_DIR}"
+    success "Created install directory: ${INSTALL_DIR}"
 }
 
 generate_env() {
-    local env_file="${INSTALL_DIR}/docker/.env"
+    local env_file="${INSTALL_DIR}/.env"
 
     if [[ -f "${env_file}" ]]; then
         info ".env file already exists — keeping existing configuration."
@@ -301,7 +306,7 @@ detect_and_allocate_ram() {
 }
 
 generate_postgresql_conf() {
-    local conf_file="${INSTALL_DIR}/docker/postgresql.conf"
+    local conf_file="${INSTALL_DIR}/postgresql.conf"
     local shared_buffers effective_cache_size maintenance_work_mem work_mem wal_buffers
 
     if [[ $POSTGRES_MEM_MB -lt 512 ]]; then
@@ -361,27 +366,76 @@ EOF
     success "Generated postgresql.conf (shared_buffers=${shared_buffers}, effective_cache_size=${effective_cache_size})"
 }
 
-generate_docker_override() {
-    local override_file="${INSTALL_DIR}/docker/docker-compose.override.yml"
+generate_docker_compose() {
+    local compose_file="${INSTALL_DIR}/docker-compose.yml"
 
-    cat > "${override_file}" <<EOF
-# Generated by Snakk installer — container memory limits
-# Based on ${TOTAL_RAM_MB}MB total system RAM
+    if [[ -f "${compose_file}" ]]; then
+        info "docker-compose.yml already exists — keeping existing configuration."
+        return
+    fi
+
+    cat > "${compose_file}" <<EOF
+# Snakk — Docker Compose (production)
+# Generated by Snakk installer on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 services:
   postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: ${POSTGRES_MEM_MB}m
+        reservations:
+          memory: 256m
+    environment:
+      POSTGRES_DB: snakk
+      POSTGRES_USER: snakk
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env file}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U snakk -d snakk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Internal only — not exposed to host
+    expose:
+      - "5432"
 
   snakk:
+    image: ${SNAKK_IMAGE}:${SNAKK_VERSION}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "\${SNAKK_PORT:-17000}:17000"
+    volumes:
+      - snakk-storage:/app/storage
     deploy:
       resources:
         limits:
           memory: ${SNAKK_MEM_MB}m
+        reservations:
+          memory: 512m
+    environment:
+      # Database host for entrypoint migration check
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      # Connection string for DbSeeder on restart (pending migrations)
+      ConnectionStrings__DbConnection: "Host=postgres;Port=5432;Database=snakk;Username=snakk;Password=\${POSTGRES_PASSWORD}"
+
+volumes:
+  pgdata:
+    driver: local
+  snakk-storage:
+    driver: local
 EOF
 
-    success "Generated docker-compose.override.yml (postgres=${POSTGRES_MEM_MB}m, snakk=${SNAKK_MEM_MB}m)"
+    success "Generated docker-compose.yml (image: ${SNAKK_IMAGE}:${SNAKK_VERSION})"
 }
 
 configure_firewall() {
@@ -488,10 +542,13 @@ EOF
     fi
 }
 
-build_and_start() {
-    info "Building and starting Snakk containers (this may take a few minutes)..."
-    cd "${INSTALL_DIR}/docker"
-    docker compose up -d --build
+pull_and_start() {
+    info "Pulling Snakk image (${SNAKK_IMAGE}:${SNAKK_VERSION})..."
+    cd "${INSTALL_DIR}"
+    docker compose pull snakk
+
+    info "Starting containers..."
+    docker compose up -d
 
     success "Containers started."
 }
@@ -503,7 +560,7 @@ wait_for_healthy() {
 
     while [[ $elapsed -lt $max_wait ]]; do
         # Check if the snakk container is running
-        if docker compose -f "${INSTALL_DIR}/docker/docker-compose.yml" ps --format json 2>/dev/null \
+        if docker compose -f "${INSTALL_DIR}/docker-compose.yml" ps --format json 2>/dev/null \
             | grep -q '"running"'; then
             success "Snakk is running!"
             return
@@ -515,7 +572,7 @@ wait_for_healthy() {
     done
 
     echo ""
-    warn "Timed out waiting for containers. Check with: docker compose -f ${INSTALL_DIR}/docker/docker-compose.yml logs"
+    warn "Timed out waiting for containers. Check with: docker compose -f ${INSTALL_DIR}/docker-compose.yml logs"
 }
 
 print_summary() {
@@ -539,6 +596,7 @@ BANNER
     echo -e "${NC}"
 
     echo "  Install directory:  ${INSTALL_DIR}"
+    echo "  Image:              ${SNAKK_IMAGE}:${SNAKK_VERSION}"
     echo ""
     echo "  Memory allocation:"
     echo "    PostgreSQL:  ${POSTGRES_MEM_MB} MB"
@@ -556,11 +614,15 @@ BANNER
     echo "    Complete the setup wizard in your browser."
     echo ""
     echo "  Useful commands:"
-    echo "    cd ${INSTALL_DIR}/docker"
+    echo "    cd ${INSTALL_DIR}"
     echo "    docker compose logs -f snakk     # View logs"
     echo "    docker compose restart            # Restart services"
     echo "    docker compose down               # Stop everything"
-    echo "    docker compose up -d --build      # Rebuild after updates"
+    echo ""
+    echo "  Update to latest version:"
+    echo "    sudo bash install.sh update"
+    echo "    — or —"
+    echo "    cd ${INSTALL_DIR} && docker compose pull snakk && docker compose up -d snakk"
     echo ""
 }
 
@@ -580,6 +642,7 @@ main() {
     echo ""
     info "This script will install prerequisites and set up Snakk."
     info "Install directory: ${INSTALL_DIR}"
+    info "Image: ${SNAKK_IMAGE}:${SNAKK_VERSION}"
     echo ""
 
     if ! ask_yes_no "Continue with installation?"; then
@@ -590,25 +653,24 @@ main() {
     echo ""
 
     # 1. Prerequisites
-    check_and_install_git
     check_and_install_docker
     check_and_install_caddy
 
     echo ""
 
-    # 2. Clone and configure
-    clone_repo
+    # 2. Configure
+    create_install_dir
     generate_env
     detect_and_allocate_ram
     generate_postgresql_conf
-    generate_docker_override
+    generate_docker_compose
     configure_firewall
     configure_caddy
 
     echo ""
 
-    # 3. Build and start
-    build_and_start
+    # 3. Pull and start
+    pull_and_start
     wait_for_healthy
 
     # 4. Done
