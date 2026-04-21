@@ -407,7 +407,7 @@ scrape_configs:
   - job_name: snakk-api
     metrics_path: /metrics
     static_configs:
-      - targets: ['snakk:5243']
+      - targets: ['snakk:17002']
 PROMEOF
 
     # Grafana datasource provisioning
