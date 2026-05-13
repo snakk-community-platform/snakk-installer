@@ -652,6 +652,7 @@ ${grafana_block}
 
     # Snakk (default)
     handle {
+        header_up X-Forwarded-Host {host}
         reverse_proxy localhost:${SNAKK_PORT}
     }
 }
