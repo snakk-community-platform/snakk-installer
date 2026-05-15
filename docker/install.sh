@@ -543,8 +543,6 @@ services:
       SETUP_PASSWORD: "\${SETUP_PASSWORD}"
       # Connection string for DbSeeder on restart (pending migrations)
       ConnectionStrings__DbConnection: "Host=postgres;Port=5432;Database=snakk;Username=snakk;Password=\${POSTGRES_PASSWORD}"
-      # Restrict Host header to the configured domain (prevents host header injection)
-      ALLOWEDHOSTS: "\${SNAKK_DOMAIN:-*}"
 ${monitoring_services}
 
 volumes:
@@ -600,7 +598,7 @@ configure_caddy() {
         return
     fi
 
-    # Persist domain so docker-compose can set ALLOWEDHOSTS on the container
+    # Persist domain to .env so it's available for future re-runs and tooling
     local env_file="${INSTALL_DIR}/.env"
     if ! grep -q "SNAKK_DOMAIN" "${env_file}" 2>/dev/null; then
         echo "SNAKK_DOMAIN=${DOMAIN}" >> "${env_file}"
