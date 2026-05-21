@@ -543,12 +543,26 @@ services:
       SETUP_PASSWORD: "\${SETUP_PASSWORD}"
       # Connection string for DbSeeder on restart (pending migrations)
       ConnectionStrings__DbConnection: "Host=postgres;Port=5432;Database=snakk;Username=snakk;Password=\${POSTGRES_PASSWORD}"
+      # Valkey cache (L2 backing store for HybridCache + shared JWT revocation)
+      Valkey__ConnectionString: valkey:6379
 ${monitoring_services}
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: valkey-server --save 60 1 --loglevel warning
+    volumes:
+      - valkey-data:/data
+    # Internal only — not exposed to host
+    expose:
+      - "6379"
 
 volumes:
   pgdata:
     driver: local
   snakk-storage:
+    driver: local
+  valkey-data:
     driver: local
 ${monitoring_volumes}
 EOF
