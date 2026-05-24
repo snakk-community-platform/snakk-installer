@@ -1418,7 +1418,7 @@ generate_docker_compose() {
       - "9100"
 
   postgres-exporter:
-    image: quay.io/prometheuscommunity/postgres_exporter:v0.16.0
+    image: prometheuscommunity/postgres-exporter:v0.16.0
     restart: unless-stopped
     depends_on:
       - postgres
