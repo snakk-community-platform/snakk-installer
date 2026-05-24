@@ -375,6 +375,11 @@ effective_io_concurrency = 200
 
 # WAL
 checkpoint_completion_target = 0.9
+
+# Logging
+log_min_duration_statement = 200
+log_lock_waits = on
+log_checkpoints = on
 EOF
 
     success "Generated postgresql.conf (shared_buffers=${shared_buffers}, effective_cache_size=${effective_cache_size})"
@@ -402,6 +407,9 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: snakk-web
     metrics_path: /internal/metrics/web
@@ -416,7 +424,107 @@ scrape_configs:
       - targets: ['snakk:17000']
         labels:
           service: api
+
+  - job_name: postgres
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          service: postgres
+
+  - job_name: valkey
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: valkey
+
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: node
 PROMEOF
+
+    # Prometheus alerting rules
+    cat > "${mon_dir}/alerts.yml" <<'ALERTEOF'
+groups:
+  - name: snakk
+    rules:
+      - alert: PostgresConnectionsHigh
+        expr: >
+          pg_stat_database_numbackends{datname="snakk"}
+          / on() group_left() pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connections above 80% of max"
+          description: "{{ $value | humanizePercentage }} of max_connections in use."
+
+      - alert: DiskSpaceLow
+        expr: >
+          (
+            node_filesystem_avail_bytes{mountpoint="/host/root", fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{mountpoint="/host/root", fstype!~"tmpfs|overlay|squashfs"}
+          ) < 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Root disk below 20% free"
+          description: "{{ $value | humanizePercentage }} disk space remaining on root filesystem."
+
+      - alert: GrpcErrorRateHigh
+        expr: >
+          (
+            sum(rate(snakk_grpc_client_duration_seconds_count{status!="OK"}[5m]))
+            / sum(rate(snakk_grpc_client_duration_seconds_count[5m]))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "gRPC client error rate above 1%"
+          description: "{{ $value | humanizePercentage }} of gRPC calls are failing."
+
+      - alert: GrpcChannelNotReady
+        expr: snakk_grpc_channel_state != 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "gRPC channel is not in Ready state"
+          description: "Channel state is {{ $value }} (2=Ready, 3=TransientFailure, 0=Idle)."
+
+      - alert: ValkeyMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valkey memory above 85% of maxmemory"
+          description: "{{ $value | humanizePercentage }} of maxmemory in use; evictions may start."
+
+      - alert: TokenRefreshFailures
+        expr: rate(snakk_token_refresh_total{result=~"error|unauthenticated"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Token refresh failure rate elevated"
+          description: "{{ $value | humanize }} refresh failures per second (result={{ $labels.result }})."
+
+      - alert: HttpLatencyHigh
+        expr: >
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP P95 latency above 2s"
+          description: "Service {{ $labels.service }} P95 latency is {{ $value | humanizeDuration }}."
+ALERTEOF
 
     # Grafana datasource provisioning
     cat > "${mon_dir}/grafana/provisioning/datasources/prometheus.yml" <<'GRAFEOF'
@@ -512,11 +620,11 @@ DASHEOF
       }
     },
     {
-      "title": "GC Heap Size (MB)",
+      "title": "GC Memory (MB)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
       "targets": [
-        { "expr": "dotnet_gc_heap_size_bytes{job=~\"snakk-.*\"} / 1024 / 1024", "legendFormat": "{{service}} Gen {{generation}}" }
+        { "expr": "dotnet_total_memory_bytes{job=~\"snakk-.*\"} / 1024 / 1024", "legendFormat": "{{service}}" }
       ],
       "fieldConfig": {
         "defaults": { "unit": "decmbytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }
@@ -534,11 +642,11 @@ DASHEOF
       }
     },
     {
-      "title": "Thread Pool Threads",
+      "title": "In-Progress HTTP Requests",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "targets": [
-        { "expr": "dotnet_threadpool_threads_count{job=~\"snakk-.*\"}", "legendFormat": "{{service}}" }
+        { "expr": "http_requests_in_progress{job=~\"snakk-.*\"}", "legendFormat": "{{service}}" }
       ],
       "fieldConfig": {
         "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }
@@ -549,7 +657,7 @@ DASHEOF
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "targets": [
-        { "expr": "rate(dotnet_gc_collections_total{job=~\"snakk-.*\"}[1m])", "legendFormat": "{{service}} Gen {{generation}}" }
+        { "expr": "rate(dotnet_collection_count_total{job=~\"snakk-.*\"}[1m])", "legendFormat": "{{service}} gen{{generation}}" }
       ],
       "fieldConfig": {
         "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }
@@ -670,6 +778,602 @@ OVERVIEWEOF
 }
 GRPCEOF
 
+    cat > "${mon_dir}/grafana/dashboards/snakk-postgres.json" <<'POSTGRESEOF'
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Active Connections",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "pg_stat_database_numbackends{datname=\"snakk\"}", "legendFormat": "" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 20 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Cache Hit Ratio",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "100 * rate(pg_stat_database_blks_hit_total{datname=\"snakk\"}[5m]) / clamp_min(rate(pg_stat_database_blks_hit_total{datname=\"snakk\"}[5m]) + rate(pg_stat_database_blks_read_total{datname=\"snakk\"}[5m]), 1)",
+          "legendFormat": ""
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 95 },
+              { "color": "green", "value": 99 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Database Size",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "pg_database_size_bytes{datname=\"snakk\"}", "legendFormat": "" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": { "mode": "fixed", "fixedColor": "blue" }
+        }
+      }
+    },
+    {
+      "title": "Deadlocks / min",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "expr": "rate(pg_stat_database_deadlocks_total{datname=\"snakk\"}[5m]) * 60", "legendFormat": "" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Transactions / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "rate(pg_stat_database_xact_commit_total{datname=\"snakk\"}[1m])",
+          "legendFormat": "Commits"
+        },
+        {
+          "expr": "rate(pg_stat_database_xact_rollback_total{datname=\"snakk\"}[1m])",
+          "legendFormat": "Rollbacks"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Rollbacks" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "pg_stat_database_numbackends{datname=\"snakk\"}",
+          "legendFormat": "Active"
+        },
+        {
+          "expr": "pg_settings_max_connections",
+          "legendFormat": "Max"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Max" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Cache Hit Ratio",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "100 * rate(pg_stat_database_blks_hit_total{datname=\"snakk\"}[5m]) / clamp_min(rate(pg_stat_database_blks_hit_total{datname=\"snakk\"}[5m]) + rate(pg_stat_database_blks_read_total{datname=\"snakk\"}[5m]), 1)",
+          "legendFormat": "Hit %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 95 },
+              { "color": "green", "value": 99 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      }
+    },
+    {
+      "title": "Locks by Mode",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "pg_locks_count{datname=\"snakk\"}",
+          "legendFormat": "{{mode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "stacking": { "mode": "normal" } }
+        }
+      }
+    },
+    {
+      "title": "Temp Files",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "rate(pg_stat_database_temp_files_total{datname=\"snakk\"}[5m])",
+          "legendFormat": "Files / sec"
+        },
+        {
+          "expr": "rate(pg_stat_database_temp_bytes_total{datname=\"snakk\"}[5m])",
+          "legendFormat": "Bytes / sec"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 0 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Bytes / sec" },
+            "properties": [{ "id": "unit", "value": "Bps" }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Checkpoints",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        {
+          "expr": "rate(pg_stat_bgwriter_checkpoints_timed_total[5m])",
+          "legendFormat": "Timed"
+        },
+        {
+          "expr": "rate(pg_stat_bgwriter_checkpoints_req_total[5m])",
+          "legendFormat": "Requested"
+        },
+        {
+          "expr": "rate(pg_stat_bgwriter_buffers_checkpoint_total[5m])",
+          "legendFormat": "Buffers written"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Requested" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["snakk", "postgres"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Snakk PostgreSQL",
+  "uid": "snakk-postgres",
+  "version": 1
+}
+POSTGRESEOF
+
+    cat > "${mon_dir}/grafana/dashboards/snakk-valkey.json" <<'VALKEYEOF'
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Hit Rate",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "100 * rate(redis_keyspace_hits_total[5m]) / clamp_min(rate(redis_keyspace_hits_total[5m]) + rate(redis_keyspace_misses_total[5m]), 1)",
+          "legendFormat": ""
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 80 }, { "color": "green", "value": 95 } ] } } }
+    },
+    {
+      "title": "Memory Used",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [ { "expr": "redis_memory_used_bytes", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "fixed", "fixedColor": "blue" } } }
+    },
+    {
+      "title": "Connected Clients",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [ { "expr": "redis_connected_clients", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 200 } ] } } }
+    },
+    {
+      "title": "Evictions / sec",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [ { "expr": "rate(redis_evicted_keys_total[5m])", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 2, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 10 } ] } } }
+    },
+    {
+      "title": "Commands / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [ { "expr": "rate(redis_commands_processed_total[1m])", "legendFormat": "Commands/s" } ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } } }
+    },
+    {
+      "title": "Hit vs Miss Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "rate(redis_keyspace_hits_total[1m])", "legendFormat": "Hits/s" },
+        { "expr": "rate(redis_keyspace_misses_total[1m])", "legendFormat": "Misses/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [ { "matcher": { "id": "byName", "options": "Misses/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] } ] }
+    },
+    {
+      "title": "Memory Used Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "redis_memory_used_bytes", "legendFormat": "Used" },
+        { "expr": "redis_memory_max_bytes > 0", "legendFormat": "Max" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [ { "matcher": { "id": "byName", "options": "Max" }, "properties": [ { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }, { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } }, { "id": "custom.fillOpacity", "value": 0 } ] } ] }
+    },
+    {
+      "title": "Evictions & Expired Keys",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "rate(redis_evicted_keys_total[5m])", "legendFormat": "Evictions/s" },
+        { "expr": "rate(redis_expired_keys_total[5m])", "legendFormat": "Expired/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50, "lineWidth": 0 } }, "overrides": [ { "matcher": { "id": "byName", "options": "Evictions/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] } ] }
+    },
+    {
+      "title": "Network I/O",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "rate(redis_net_input_bytes_total[1m])", "legendFormat": "In" },
+        { "expr": "rate(redis_net_output_bytes_total[1m])", "legendFormat": "Out" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } } }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["snakk", "valkey"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Snakk Valkey",
+  "uid": "snakk-valkey",
+  "version": 1
+}
+VALKEYEOF
+
+    cat > "${mon_dir}/grafana/dashboards/snakk-system.json" <<'SYSTEMEOF'
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Disk Free (root)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [ { "expr": "100 * node_filesystem_avail_bytes{mountpoint=\"/host/root\",fstype!~\"tmpfs|overlay|squashfs\"} / node_filesystem_size_bytes{mountpoint=\"/host/root\",fstype!~\"tmpfs|overlay|squashfs\"}", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 20 }, { "color": "green", "value": 40 } ] } } }
+    },
+    {
+      "title": "CPU Usage",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [ { "expr": "100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 } ] } } }
+    },
+    {
+      "title": "Memory Available",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [ { "expr": "node_memory_MemAvailable_bytes", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "fixed", "fixedColor": "blue" } } }
+    },
+    {
+      "title": "Load Average (1m)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [ { "expr": "node_load1", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 2, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 2 }, { "color": "red", "value": 4 } ] } } }
+    },
+    {
+      "title": "CPU Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)", "legendFormat": "CPU %" },
+        { "expr": "avg by(instance) (rate(node_cpu_seconds_total{mode=\"iowait\"}[1m])) * 100", "legendFormat": "IO Wait %" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [ { "matcher": { "id": "byName", "options": "IO Wait %" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] } ] }
+    },
+    {
+      "title": "Memory",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes", "legendFormat": "Used" },
+        { "expr": "node_memory_MemTotal_bytes", "legendFormat": "Total" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [ { "matcher": { "id": "byName", "options": "Total" }, "properties": [ { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }, { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } }, { "id": "custom.fillOpacity", "value": 0 } ] } ] }
+    },
+    {
+      "title": "Disk Space (root)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "node_filesystem_size_bytes{mountpoint=\"/host/root\",fstype!~\"tmpfs|overlay|squashfs\"} - node_filesystem_avail_bytes{mountpoint=\"/host/root\",fstype!~\"tmpfs|overlay|squashfs\"}", "legendFormat": "Used" },
+        { "expr": "node_filesystem_size_bytes{mountpoint=\"/host/root\",fstype!~\"tmpfs|overlay|squashfs\"}", "legendFormat": "Total" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [ { "matcher": { "id": "byName", "options": "Total" }, "properties": [ { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }, { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } }, { "id": "custom.fillOpacity", "value": 0 } ] } ] }
+    },
+    {
+      "title": "Disk I/O",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "rate(node_disk_read_bytes_total[1m])", "legendFormat": "Read" },
+        { "expr": "rate(node_disk_written_bytes_total[1m])", "legendFormat": "Write" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [ { "matcher": { "id": "byName", "options": "Write" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] } ] }
+    },
+    {
+      "title": "Network I/O",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "rate(node_network_receive_bytes_total{device!~\"lo|veth.*|docker.*\"}[1m])", "legendFormat": "In ({{device}})" },
+        { "expr": "rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|docker.*\"}[1m])", "legendFormat": "Out ({{device}})" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } } }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["snakk", "system"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Snakk System",
+  "uid": "snakk-system",
+  "version": 1
+}
+SYSTEMEOF
+
+    cat > "${mon_dir}/grafana/dashboards/snakk-application.json" <<'APPEOF'
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "In-Progress HTTP Requests",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [ { "expr": "sum(http_requests_in_progress{job=~\"snakk-.*\"})", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 200 } ] } } }
+    },
+    {
+      "title": "Token Refreshes / min",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [ { "expr": "sum(rate(snakk_token_refresh_total[5m])) * 60", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "color": { "mode": "fixed", "fixedColor": "blue" } } }
+    },
+    {
+      "title": "Token Refresh Failures / min",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [ { "expr": "sum(rate(snakk_token_refresh_total{result=~\"error|unauthenticated\"}[5m])) * 60", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 2, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 10 } ] } } }
+    },
+    {
+      "title": "Pending Token Refreshes / min",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [ { "expr": "rate(snakk_token_refresh_total{result=\"pending\"}[5m]) * 60", "legendFormat": "" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 2, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 20 } ] } } }
+    },
+    {
+      "title": "In-Progress HTTP Requests Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [ { "expr": "http_requests_in_progress{job=~\"snakk-.*\"}", "legendFormat": "{{service}}" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 } } }
+    },
+    {
+      "title": "Token Refresh Outcomes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [ { "expr": "rate(snakk_token_refresh_total[1m]) * 60", "legendFormat": "{{result}}" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 0, "stacking": { "mode": "normal" } } }, "overrides": [ { "matcher": { "id": "byName", "options": "success" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] }, { "matcher": { "id": "byName", "options": "unauthenticated" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }, { "matcher": { "id": "byName", "options": "error" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }, { "matcher": { "id": "byName", "options": "pending" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] } ] }
+    },
+    {
+      "title": "P50 / P95 / P99 Request Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=~\"snakk-.*\"}[5m])) by (le, service))", "legendFormat": "P99 {{service}}" },
+        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~\"snakk-.*\"}[5m])) by (le, service))", "legendFormat": "P95 {{service}}" },
+        { "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{job=~\"snakk-.*\"}[5m])) by (le, service))", "legendFormat": "P50 {{service}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } } }
+    },
+    {
+      "title": "Error Rate by Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "sum(rate(http_request_duration_seconds_count{job=~\"snakk-.*\",code=~\"5..\"}[1m])) by (service)", "legendFormat": "5xx {{service}}" },
+        { "expr": "sum(rate(http_request_duration_seconds_count{job=~\"snakk-.*\",code=~\"4..\"}[1m])) by (service)", "legendFormat": "4xx {{service}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "bars", "fillOpacity": 50, "lineWidth": 0, "stacking": { "mode": "normal" } } }, "overrides": [ { "matcher": { "id": "byRegexp", "options": "5xx" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }, { "matcher": { "id": "byRegexp", "options": "4xx" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] } ] }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["snakk", "application"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Snakk Application",
+  "uid": "snakk-application",
+  "version": 1
+}
+APPEOF
+
     success "Monitoring config files created."
 }
 
@@ -687,11 +1391,48 @@ generate_docker_compose() {
     if [[ "${ENABLE_MONITORING}" == true ]]; then
         monitoring_services=$(cat <<'MONEOF'
 
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    restart: unless-stopped
+    depends_on:
+      - valkey
+    environment:
+      REDIS_ADDR: "redis://valkey:6379"
+    expose:
+      - "9121"
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    restart: unless-stopped
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    expose:
+      - "9100"
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres_exporter:v0.16.0
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      DATA_SOURCE_NAME: "postgresql://snakk:${POSTGRES_PASSWORD}@postgres:5432/snakk?sslmode=disable"
+    expose:
+      - "9187"
+
   prometheus:
     image: prom/prometheus:v3.4.0
     restart: unless-stopped
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
