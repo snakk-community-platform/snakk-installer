@@ -396,18 +396,26 @@ configure_monitoring() {
     mkdir -p "${mon_dir}/grafana/provisioning/dashboards"
     mkdir -p "${mon_dir}/grafana/dashboards"
 
-    # Prometheus config
+    # Prometheus config — scrapes via the gateway since internal services bind to 127.0.0.1
     cat > "${mon_dir}/prometheus.yml" <<'PROMEOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
 scrape_configs:
   - job_name: snakk-web
-    metrics_path: /metrics
+    metrics_path: /internal/metrics/web
     static_configs:
       - targets: ['snakk:17000']
+        labels:
+          service: web
 
   - job_name: snakk-api
-    metrics_path: /metrics
+    metrics_path: /internal/metrics/api
     static_configs:
-      - targets: ['snakk:17002']
+      - targets: ['snakk:17000']
+        labels:
+          service: api
 PROMEOF
 
     # Grafana datasource provisioning
@@ -431,6 +439,236 @@ providers:
     options:
       path: /var/lib/grafana/dashboards
 DASHEOF
+
+    # Grafana dashboards
+    cat > "${mon_dir}/grafana/dashboards/snakk-overview.json" <<'OVERVIEWEOF'
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(http_request_duration_seconds_count[1m])) by (service)", "legendFormat": "{{service}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "Request Latency P95 (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))", "legendFormat": "P95 {{service}}" },
+        { "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))", "legendFormat": "P50 {{service}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "HTTP Status Codes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(http_request_duration_seconds_count[1m])) by (code)", "legendFormat": "{{code}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "bars", "fillOpacity": 50, "lineWidth": 0, "stacking": { "mode": "normal" } } },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "^2" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": "^4" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": "^5" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      }
+    },
+    {
+      "title": "Slowest Endpoints (P95)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "topk(10, histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, controller, action)))", "format": "table", "instant": true }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true } } }
+      ]
+    },
+    {
+      "title": "Process Memory (MB)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "process_working_set_bytes{job=~\"snakk-.*\"} / 1024 / 1024", "legendFormat": "{{service}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "decmbytes", "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "GC Heap Size (MB)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        { "expr": "dotnet_gc_heap_size_bytes{job=~\"snakk-.*\"} / 1024 / 1024", "legendFormat": "{{service}} Gen {{generation}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "decmbytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }
+      }
+    },
+    {
+      "title": "CPU Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        { "expr": "rate(process_cpu_seconds_total{job=~\"snakk-.*\"}[1m])", "legendFormat": "{{service}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "Thread Pool Threads",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        { "expr": "dotnet_threadpool_threads_count{job=~\"snakk-.*\"}", "legendFormat": "{{service}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "GC Collections Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        { "expr": "rate(dotnet_gc_collections_total{job=~\"snakk-.*\"}[1m])", "legendFormat": "{{service}} Gen {{generation}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["snakk"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Snakk Overview",
+  "uid": "snakk-overview",
+  "version": 1
+}
+OVERVIEWEOF
+
+    cat > "${mon_dir}/grafana/dashboards/snakk-grpc.json" <<'GRPCEOF'
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Channel State",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 4, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "snakk_grpc_channel_state", "legendFormat": "" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "auto",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "yellow", "value": null },
+              { "color": "green", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "Idle",             "color": "yellow",   "index": 0 },
+                "1": { "text": "Connecting",        "color": "blue",     "index": 1 },
+                "2": { "text": "Ready",             "color": "green",    "index": 2 },
+                "3": { "text": "Transient Failure", "color": "red",      "index": 3 },
+                "4": { "text": "Shutdown",          "color": "dark-red", "index": 4 }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Call Rate by Method (calls/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 20, "x": 4, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(snakk_grpc_client_duration_seconds_count[1m])) by (method)", "legendFormat": "{{method}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "Call Latency by Method",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(snakk_grpc_client_duration_seconds_bucket[5m])) by (le, method))", "legendFormat": "P95 {{method}}" },
+        { "expr": "histogram_quantile(0.50, sum(rate(snakk_grpc_client_duration_seconds_bucket[5m])) by (le, method))", "legendFormat": "P50 {{method}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "Errors by Method & Status (calls/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(snakk_grpc_client_duration_seconds_count{status!=\"OK\"}[1m])) by (method, status)", "legendFormat": "{{method}} / {{status}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "bars", "fillOpacity": 50, "lineWidth": 0, "stacking": { "mode": "normal" } } },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "DeadlineExceeded" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": "Unauthenticated" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
+        ]
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["snakk", "grpc"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Snakk gRPC",
+  "uid": "snakk-grpc",
+  "version": 1
+}
+GRPCEOF
 
     success "Monitoring config files created."
 }
