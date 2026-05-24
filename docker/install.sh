@@ -425,6 +425,20 @@ scrape_configs:
         labels:
           service: api
 
+  - job_name: snakk-auth
+    metrics_path: /internal/metrics/auth
+    static_configs:
+      - targets: ['snakk:17000']
+        labels:
+          service: auth
+
+  - job_name: snakk-public-api
+    metrics_path: /internal/metrics/public-api
+    static_configs:
+      - targets: ['snakk:17000']
+        labels:
+          service: public-api
+
   - job_name: postgres
     static_configs:
       - targets: ['postgres-exporter:9187']
@@ -1053,6 +1067,68 @@ GRPCEOF
         "overrides": [
           {
             "matcher": { "id": "byName", "options": "Requested" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Rows Read / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        {
+          "expr": "rate(pg_stat_database_tup_fetched_total{datname=\"snakk\"}[1m])",
+          "legendFormat": "Fetched (index hits)"
+        },
+        {
+          "expr": "rate(pg_stat_database_tup_returned_total{datname=\"snakk\"}[1m])",
+          "legendFormat": "Returned (rows scanned)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rowsps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Returned (rows scanned)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Rows Written / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        {
+          "expr": "rate(pg_stat_database_tup_inserted_total{datname=\"snakk\"}[1m])",
+          "legendFormat": "Inserts"
+        },
+        {
+          "expr": "rate(pg_stat_database_tup_updated_total{datname=\"snakk\"}[1m])",
+          "legendFormat": "Updates"
+        },
+        {
+          "expr": "rate(pg_stat_database_tup_deleted_total{datname=\"snakk\"}[1m])",
+          "legendFormat": "Deletes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rowsps",
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Updates" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Deletes" },
             "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
           }
         ]
