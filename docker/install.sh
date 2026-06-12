@@ -37,6 +37,7 @@ GRAFANA_PASSWORD=""  # generated password for Grafana admin
 ENABLE_MONITORING=false  # whether to install Prometheus + Grafana
 TOTAL_RAM_MB=0   # detected total system RAM
 POSTGRES_MEM_MB=0
+VALKEY_MEM_MB=256
 SNAKK_MEM_MB=0
 
 # =============================================================================
@@ -289,10 +290,18 @@ detect_and_allocate_ram() {
         # 4.5–8.5 GB total
         POSTGRES_MEM_MB=2048
         SNAKK_MEM_MB=3072
-    else
-        # 9+ GB total
+        VALKEY_MEM_MB=256
+    elif [[ $available -lt 12288 ]]; then
+        # 8.5–12.5 GB total
         POSTGRES_MEM_MB=4096
         SNAKK_MEM_MB=4096
+        VALKEY_MEM_MB=384
+    else
+        # 13+ GB total (e.g. 16 GB host: Postgres 5 GB, app 8 GB,
+        # leaving ~2.5 GB for OS, Valkey, and optional monitoring)
+        POSTGRES_MEM_MB=5120
+        SNAKK_MEM_MB=8192
+        VALKEY_MEM_MB=512
     fi
 
     local total_docker=$((POSTGRES_MEM_MB + SNAKK_MEM_MB))
@@ -321,7 +330,7 @@ detect_and_allocate_ram() {
 
 generate_postgresql_conf() {
     local conf_file="${INSTALL_DIR}/postgresql.conf"
-    local shared_buffers effective_cache_size maintenance_work_mem work_mem wal_buffers
+    local shared_buffers effective_cache_size maintenance_work_mem work_mem wal_buffers max_wal_size
 
     if [[ $POSTGRES_MEM_MB -lt 512 ]]; then
         shared_buffers="96MB"
@@ -329,30 +338,37 @@ generate_postgresql_conf() {
         maintenance_work_mem="32MB"
         work_mem="2MB"
         wal_buffers="4MB"
+        max_wal_size="512MB"
     elif [[ $POSTGRES_MEM_MB -lt 1024 ]]; then
         shared_buffers="160MB"
         effective_cache_size="480MB"
         maintenance_work_mem="64MB"
         work_mem="4MB"
         wal_buffers="8MB"
+        max_wal_size="512MB"
     elif [[ $POSTGRES_MEM_MB -lt 2048 ]]; then
         shared_buffers="256MB"
         effective_cache_size="768MB"
         maintenance_work_mem="128MB"
         work_mem="4MB"
         wal_buffers="8MB"
+        max_wal_size="1GB"
     elif [[ $POSTGRES_MEM_MB -lt 4096 ]]; then
         shared_buffers="512MB"
         effective_cache_size="1536MB"
         maintenance_work_mem="256MB"
         work_mem="8MB"
         wal_buffers="16MB"
+        max_wal_size="1GB"
     else
-        shared_buffers="1GB"
-        effective_cache_size="3GB"
+        # Scale proportionally above 4 GB: 25% shared_buffers, 70% effective_cache_size
+        # (page cache counts against the container's cgroup limit)
+        shared_buffers="$((POSTGRES_MEM_MB / 4))MB"
+        effective_cache_size="$((POSTGRES_MEM_MB * 70 / 100))MB"
         maintenance_work_mem="512MB"
         work_mem="16MB"
         wal_buffers="16MB"
+        max_wal_size="2GB"
     fi
 
     cat > "${conf_file}" <<EOF
@@ -373,8 +389,23 @@ wal_buffers = ${wal_buffers}
 random_page_cost = 1.1
 effective_io_concurrency = 200
 
+# OLTP workload: short queries lose more to JIT compilation overhead than they gain
+jit = off
+
+# Connections — must exceed the sum of app pool sizes (Npgsql MaxPoolSize).
+# The PostgresConnectionsHigh alert fires at 80% of this value.
+max_connections = 150
+
 # WAL
 checkpoint_completion_target = 0.9
+max_wal_size = ${max_wal_size}
+wal_compression = on
+
+# Safety net: abandoned transactions release their locks/snapshots after 60s
+idle_in_transaction_session_timeout = 60000
+
+# I/O timing in pg_stat_database and EXPLAIN (ANALYZE, BUFFERS) — negligible overhead
+track_io_timing = on
 
 # Logging
 log_min_duration_statement = 200
@@ -1484,7 +1515,7 @@ generate_docker_compose() {
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
-      - /:/host/root:ro,rslave
+      - /:/host/root:ro
     command:
       - --path.procfs=/host/proc
       - --path.sysfs=/host/sys
@@ -1564,6 +1595,11 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
     command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U snakk -d snakk"]
       interval: 10s
@@ -1596,18 +1632,36 @@ services:
       DB_PORT: "5432"
       # Setup wizard password
       SETUP_PASSWORD: "\${SETUP_PASSWORD}"
-      # Connection string for DbSeeder on restart (pending migrations)
-      ConnectionStrings__DbConnection: "Host=postgres;Port=5432;Database=snakk;Username=snakk;Password=\${POSTGRES_PASSWORD}"
+      # Connection string for DbSeeder on restart (pending migrations).
+      # Auto-prepare promotes hot query shapes to server-side prepared statements.
+      ConnectionStrings__DbConnection: "Host=postgres;Port=5432;Database=snakk;Username=snakk;Password=\${POSTGRES_PASSWORD};Maximum Auto Prepare=20;Auto Prepare Min Usages=2"
       # Valkey cache (L2 backing store for HybridCache + shared JWT revocation)
       Valkey__ConnectionString: valkey:6379
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
 ${monitoring_services}
 
   valkey:
     image: valkey/valkey:8-alpine
     restart: unless-stopped
-    command: valkey-server --save 60 1 --loglevel warning
+    # noeviction is REQUIRED: Valkey stores JWT/session revocations alongside cache
+    # entries — evicting a revocation would un-revoke a token. The ValkeyMemoryHigh
+    # alert fires before the cap is reached.
+    command: valkey-server --save 60 1 --loglevel warning --maxmemory ${VALKEY_MEM_MB}mb --maxmemory-policy noeviction
+    deploy:
+      resources:
+        limits:
+          memory: $((VALKEY_MEM_MB + 128))m
     volumes:
       - valkey-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
     # Internal only — not exposed to host
     expose:
       - "6379"
