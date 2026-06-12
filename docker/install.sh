@@ -1710,7 +1710,7 @@ services:
       SETUP_PASSWORD: "\${SETUP_PASSWORD}"
       # Connection string for DbSeeder on restart (pending migrations).
       # Auto-prepare promotes hot query shapes to server-side prepared statements.
-      ConnectionStrings__DbConnection: "Host=postgres;Port=5432;Database=snakk;Username=snakk;Password=\${POSTGRES_PASSWORD};Maximum Auto Prepare=20;Auto Prepare Min Usages=2"
+      ConnectionStrings__DbConnection: "Host=postgres;Port=5432;Database=snakk;Username=snakk;Password=\${POSTGRES_PASSWORD};Max Auto Prepare=20;Auto Prepare Min Usages=2"
       # Valkey cache (L2 backing store for HybridCache + shared JWT revocation)
       Valkey__ConnectionString: valkey:6379
     logging:
