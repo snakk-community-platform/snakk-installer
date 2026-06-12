@@ -32,6 +32,8 @@ SNAKK_PORT=17000
 DISTRO=""        # ubuntu | debian | rocky | alma | rhel | arch
 PKG_MGR=""       # apt | dnf | pacman
 DOMAIN=""        # user-provided domain (empty = skip Caddy)
+PROXY_MODE="caddy"   # caddy | tunnel | none — chosen interactively
+TUNNEL_TOKEN=""      # Cloudflare Tunnel connector token (tunnel mode)
 DB_PASSWORD=""   # generated password
 GRAFANA_PASSWORD=""  # generated password for Grafana admin
 ENABLE_MONITORING=false  # whether to install Prometheus + Grafana
@@ -185,7 +187,48 @@ check_and_install_docker() {
     success "Docker installed and started."
 }
 
+choose_reverse_proxy() {
+    echo ""
+    echo "  How should Snakk be exposed to the internet?"
+    echo ""
+    echo "    1) Caddy — reverse proxy on this server with automatic Let's Encrypt"
+    echo "       HTTPS. Requires ports 80/443 open and a domain pointing at this IP."
+    echo "    2) Cloudflare Tunnel — outbound-only connector (cloudflared). No open"
+    echo "       ports, origin IP stays hidden. Requires a domain on Cloudflare and"
+    echo "       a tunnel token from the Zero Trust dashboard."
+    echo "    3) None — access Snakk directly on port ${SNAKK_PORT} (configure your"
+    echo "       own proxy/TLS later)."
+    echo ""
+    local choice
+    choice=$(ask_input "Choose [1/2/3] (default 1): ")
+    case "${choice}" in
+        2)
+            PROXY_MODE="tunnel"
+            echo ""
+            info "Create the tunnel first if you haven't:"
+            info "  Cloudflare Zero Trust (one.dash.cloudflare.com)"
+            info "  -> Networks -> Tunnels -> Create a tunnel -> Cloudflared"
+            info "  Then add a Public Hostname: your-domain -> http://snakk:17000"
+            echo ""
+            TUNNEL_TOKEN=$(ask_input "Paste the tunnel token (or press Enter to add it to .env later): ")
+            if [[ -z "${TUNNEL_TOKEN}" ]]; then
+                warn "No token provided — cloudflared will not start until you set TUNNEL_TOKEN in ${INSTALL_DIR}/.env"
+            fi
+            ;;
+        3)
+            PROXY_MODE="none"
+            ;;
+        *)
+            PROXY_MODE="caddy"
+            ;;
+    esac
+}
+
 check_and_install_caddy() {
+    if [[ "${PROXY_MODE}" != "caddy" ]]; then
+        info "Skipping Caddy (${PROXY_MODE} mode selected)."
+        return
+    fi
     if command -v caddy &>/dev/null; then
         success "Caddy is already installed ($(caddy version))"
         return
@@ -262,6 +305,15 @@ append_grafana_password_to_env() {
     if grep -q "GRAFANA_PASSWORD" "${env_file}" 2>/dev/null; then return; fi
 
     echo "GRAFANA_PASSWORD=${GRAFANA_PASSWORD}" >> "${env_file}"
+}
+
+append_tunnel_token_to_env() {
+    if [[ "${PROXY_MODE}" != "tunnel" ]] || [[ -z "${TUNNEL_TOKEN}" ]]; then return; fi
+
+    local env_file="${INSTALL_DIR}/.env"
+    if grep -q "TUNNEL_TOKEN" "${env_file}" 2>/dev/null; then return; fi
+
+    echo "TUNNEL_TOKEN=${TUNNEL_TOKEN}" >> "${env_file}"
 }
 
 detect_and_allocate_ram() {
@@ -1494,6 +1546,30 @@ generate_docker_compose() {
 
     local monitoring_services=""
     local monitoring_volumes=""
+    local tunnel_service=""
+
+    if [[ "${PROXY_MODE}" == "tunnel" ]]; then
+        tunnel_service=$(cat <<'TUNEOF'
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    # Outbound-only connector to Cloudflare's edge — no inbound ports needed.
+    # Public hostname mapping (your-domain -> http://snakk:17000) is configured
+    # in the Cloudflare Zero Trust dashboard, not here.
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Set TUNNEL_TOKEN in .env file}
+    depends_on:
+      - snakk
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+TUNEOF
+)
+    fi
 
     if [[ "${ENABLE_MONITORING}" == true ]]; then
         monitoring_services=$(cat <<'MONEOF'
@@ -1642,6 +1718,7 @@ services:
       options:
         max-size: 50m
         max-file: "3"
+${tunnel_service}
 ${monitoring_services}
 
   valkey:
@@ -1680,6 +1757,15 @@ EOF
 }
 
 configure_firewall() {
+    if [[ "${PROXY_MODE}" == "tunnel" ]]; then
+        info "Cloudflare Tunnel is outbound-only — no inbound ports needed; skipping firewall changes."
+        return
+    fi
+    if [[ "${PROXY_MODE}" == "none" ]]; then
+        info "No reverse proxy selected — open port ${SNAKK_PORT} manually if you need remote access."
+        return
+    fi
+
     if [[ "$PKG_MGR" == "apt" ]] || [[ "$PKG_MGR" == "pacman" ]]; then
         # ufw (Ubuntu/Debian/Arch)
         if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
@@ -1707,6 +1793,9 @@ configure_firewall() {
 }
 
 configure_caddy() {
+    if [[ "${PROXY_MODE}" != "caddy" ]]; then
+        return
+    fi
     if ! command -v caddy &>/dev/null; then
         info "Caddy not installed — skipping reverse proxy configuration."
         return
@@ -1889,6 +1978,22 @@ BANNER
         echo ""
     fi
 
+    if [[ "${PROXY_MODE}" == "tunnel" ]]; then
+        echo "  Cloudflare Tunnel checklist:"
+        echo "    1. Zero Trust -> Networks -> Tunnels -> your tunnel -> Public Hostname:"
+        echo "         <your-domain>  ->  http://snakk:17000"
+        if [[ "${ENABLE_MONITORING}" == true ]]; then
+            echo "    2. Grafana: add a path rule  <your-domain> path grafana*  ->  http://grafana:3000"
+            echo "       (Grafana's own admin login applies — credentials above)"
+        fi
+        echo "    3. Remove any old A/AAAA DNS records pointing at this server's IP."
+        if [[ -z "${TUNNEL_TOKEN}" ]]; then
+            echo "    4. Set TUNNEL_TOKEN in ${INSTALL_DIR}/.env, then:"
+            echo "         cd ${INSTALL_DIR} && docker compose up -d cloudflared"
+        fi
+        echo ""
+    fi
+
     echo "  Next step:"
     echo "    Visit ${url}"
     echo "    Complete the setup wizard in your browser."
@@ -1933,6 +2038,7 @@ main() {
     echo ""
 
     # 1. Prerequisites
+    choose_reverse_proxy
     check_and_install_docker
     check_and_install_caddy
 
@@ -1945,6 +2051,7 @@ main() {
     generate_postgresql_conf
     configure_monitoring
     append_grafana_password_to_env
+    append_tunnel_token_to_env
     generate_docker_compose
     configure_firewall
     configure_caddy
